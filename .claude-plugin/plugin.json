@@ -1,0 +1,22 @@
+{
+  "name": "quota-planner",
+  "displayName": "Claude Quota Planner",
+  "version": "0.3.0",
+  "description": "Makes Claude Code's quota visible and plannable: a status line that draws the 5-hour, 7-day and gateway spend windows \u2014 or, on pay-per-token auth, your USD budget \u2014 and an MCP server that turns those readings into go/no-go answers for the work in front of you.",
+  "author": {
+    "name": "FlukRocker",
+    "url": "https://github.com/FlukRocker"
+  },
+  "homepage": "https://github.com/FlukRocker/claude-quota-planner",
+  "repository": "https://github.com/FlukRocker/claude-quota-planner",
+  "license": "MIT",
+  "keywords": [
+    "quota",
+    "rate-limits",
+    "budget",
+    "statusline",
+    "mcp",
+    "planning"
+  ],
+  "mcpServers": "./.mcp.json"
+}

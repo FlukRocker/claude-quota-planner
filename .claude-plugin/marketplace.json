@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-quota-planner",
+  "description": "Quota visibility and session planning for Claude Code subscriptions.",
+  "owner": {
+    "name": "FlukRocker",
+    "url": "https://github.com/FlukRocker"
+  },
+  "plugins": [
+    {
+      "name": "quota-planner",
+      "source": "./",
+      "description": "5h/7d quota status line plus an MCP server that plans tasks against what is left in the window.",
+      "category": "productivity"
+    }
+  ]
+}

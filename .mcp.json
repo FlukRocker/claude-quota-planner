@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "quota-planner": {
+      "command": "uv",
+      "args": ["run", "--script", "${CLAUDE_PLUGIN_ROOT}/quota_planner.py"]
+    }
+  }
+}

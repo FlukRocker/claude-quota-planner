@@ -5,6 +5,12 @@ statusline-quota.py — Claude Code status line + quota snapshot writer.
 Line 1:  branch* +added/-removed │ Model[1m] │ 469K/1M (47%) │ $12.29/hr
 Line 2:  5h ━━━━━━╸───── 36%  3h 29m left      7d ━╸────────── 8%  resets 1d 8h
 
+Subscriber sessions get the rate-limit windows above. API-key, Bedrock and Vertex
+sessions are never sent rate_limits at all, so line 2 falls back to SPEND MODE:
+the same bars drawn against USD budgets you set, filled from cost.total_cost_usd.
+
+Line 2:  day ━━━━━╸────── $9.80/$20  14h left    mo ━━╸───────── $88/$300  12d
+
 Both quota bars share one line. No emoji. Bars are true-colour gradients:
 each cell is coloured by its own position on the 0-100 scale, so the palette
 runs green -> amber -> orange -> red as the bar fills.
@@ -19,8 +25,11 @@ Environment:
   QUOTA_BAR_PALETTE   cyber|neon|severity    (default cyber)
   QUOTA_BAR_WIDTH     cells per bar          (default 12)
   NO_COLOR            set to disable colour entirely
+  QUOTA_BUDGET_USD_DAILY    spend-mode daily ceiling in USD   (overrides budget.json)
+  QUOTA_BUDGET_USD_MONTHLY  spend-mode monthly ceiling in USD (overrides budget.json)
 """
 
+import calendar
 import json
 import os
 import subprocess
@@ -32,6 +41,8 @@ QDIR = Path(os.environ.get("CLAUDE_QUOTA_DIR", Path.home() / ".claude" / "quota"
 SNAPSHOT = QDIR / "snapshot.json"
 HISTORY = QDIR / "history.jsonl"
 GITCACHE = QDIR / ".gitcache.json"
+SPEND = QDIR / "spend.json"
+BUDGET = QDIR / "budget.json"
 DELEGATE = os.environ.get("CLAUDE_QUOTA_DELEGATE", "")
 
 WIDTH = max(4, int(os.environ.get("QUOTA_BAR_WIDTH", 12)))
@@ -163,23 +174,24 @@ def paint_pair(fg, bg, ch):
 # --------------------------------------------------------------------------- #
 # bar
 # --------------------------------------------------------------------------- #
-def bar(pct):
+def bar(pct, width=None):
     """Gradient progress bar carrying twice its column count in colour steps.
 
     Each column is a left half block, so its foreground paints the left half and its background
     paints the right half: WIDTH columns carry 2*WIDTH colours. That is where the smoothness
     comes from - not from a wider bar, which would cost the line width the second window needs.
     """
+    width = WIDTH if width is None else max(4, width)
     pct = min(max(float(pct or 0), 0.0), 100.0)
     if STYLE == "ascii" or NO_COLOR:
         # Half blocks are meaningless without colour - both halves are the same character.
-        f = round(pct / 100 * WIDTH)
-        return "[" + "=" * f + "-" * (WIDTH - f) + "]"
+        f = round(pct / 100 * width)
+        return "[" + "=" * f + "-" * (width - f) + "]"
 
-    subs = WIDTH * 2
+    subs = width * 2
     filled = int(round(pct / 100 * subs))
     out = []
-    for cell in range(WIDTH):
+    for cell in range(width):
         halves = []
         for k in (0, 1):
             i = cell * 2 + k
@@ -202,6 +214,14 @@ def human_tokens(n):
     if n >= 1_000:
         return f"{round(n / 1_000)}K"
     return str(n)
+
+
+def money(v):
+    """$0.42 stays readable; $1,204 doesn't need cents."""
+    v = float(v or 0)
+    if v >= 100 or v == int(v):
+        return f"${v:,.0f}"
+    return f"${v:,.2f}"
 
 
 def countdown(epoch, now):
@@ -246,7 +266,143 @@ def git_info(cwd):
 
 
 # --------------------------------------------------------------------------- #
-# persistence (unchanged contract — MCP server and hooks read these)
+# spend ledger (pay-per-token sessions: API key, Bedrock, Vertex)
+# --------------------------------------------------------------------------- #
+def _write_json(path, obj):
+    try:
+        QDIR.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps(obj))
+        tmp.replace(path)
+    except Exception:
+        pass
+
+
+def load_budget():
+    """USD ceilings: budget.json is the store, env vars win over it."""
+    try:
+        cfg = json.loads(BUDGET.read_text())
+    except Exception:
+        cfg = {}
+    out = {}
+    for key, env in (("daily_usd", "QUOTA_BUDGET_USD_DAILY"),
+                     ("monthly_usd", "QUOTA_BUDGET_USD_MONTHLY")):
+        val = os.environ.get(env, cfg.get(key))
+        try:
+            val = float(val)
+        except (TypeError, ValueError):
+            val = None
+        out[key] = val if val and val > 0 else None
+    return out
+
+
+def load_spend_source():
+    """'local' estimate, or 'cost_report' billed figures the MCP server pulled in.
+
+    The status line never calls the network itself — it only reads what
+    reconcile_spend wrote into spend.json.
+    """
+    env = os.environ.get("QUOTA_SPEND_SOURCE")
+    if env in ("local", "cost_report"):
+        return env
+    try:
+        cfg = json.loads(BUDGET.read_text())
+    except Exception:
+        cfg = {}
+    return "cost_report" if cfg.get("spend_source") == "cost_report" else "local"
+
+
+def update_spend(session_id, usd, now):
+    """Accumulate per-day and per-month spend across every session on this machine.
+
+    cost.total_cost_usd is a per-session RUNNING TOTAL, so the cross-session
+    figure is the sum of per-session deltas, not of the totals themselves. A
+    total that moves backwards means /clear reset that session's counter, so the
+    new value is itself the delta rather than a negative one.
+    """
+    lt = time.localtime(now)
+    day = time.strftime("%Y-%m-%d", lt)
+    month = day[:7]
+    try:
+        led = json.loads(SPEND.read_text())
+    except Exception:
+        led = {}
+    sessions = led.get("sessions") or {}
+    days = led.get("days") or {}
+    months = led.get("months") or {}
+
+    key = session_id or "unknown"
+    prev = float((sessions.get(key) or {}).get("last") or 0.0)
+    delta = usd if usd < prev else usd - prev
+    if delta > 0:
+        days[day] = round(float(days.get(day) or 0) + delta, 6)
+        months[month] = round(float(months.get(month) or 0) + delta, 6)
+    sessions[key] = {"last": usd, "ts": now}
+
+    led["sessions"] = {k: v for k, v in sessions.items()
+                       if now - float(v.get("ts") or 0) < 7 * 86400}
+    led["days"] = dict(sorted(days.items())[-45:])
+    led["months"] = dict(sorted(months.items())[-13:])
+    _write_json(SPEND, led)
+
+    budget = load_budget()
+    daily = float(led["days"].get(day) or 0)
+    monthly = float(led["months"].get(month) or 0)
+    reset, secondary_reset = day_end(now), month_end(now)
+
+    # Billed figures, when reconcile_spend has fetched them, are UTC-day buckets:
+    # take the reset boundaries with them or the bar counts down the wrong window.
+    billed = (led.get("billed") or {}).get("days") or {}
+    utc_day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    use_billed = load_spend_source() == "cost_report" and utc_day in billed
+    if use_billed:
+        day, month = utc_day, utc_day[:7]
+        daily = float(billed[utc_day])
+        monthly = sum(float(v) for d, v in billed.items() if d[:7] == month)
+        reset, secondary_reset = day_end_utc(now), month_end_utc(now)
+
+    return {
+        "day": day,
+        "month": month,
+        "daily_usd": daily,
+        "monthly_usd": monthly,
+        "daily_budget_usd": budget["daily_usd"],
+        "monthly_budget_usd": budget["monthly_usd"],
+        "session_usd": usd,
+        "reset_at": reset,
+        "secondary_reset_at": secondary_reset,
+        # False only when these are billed amounts; the local figure is a
+        # client-side estimate at list price, not your invoice.
+        "estimated": not use_billed,
+    }
+
+
+def day_end(now):
+    """Epoch seconds at the next local midnight — the daily budget's reset."""
+    lt = time.localtime(now)
+    return now + (86400 - (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec))
+
+
+def month_end(now):
+    """Epoch seconds at the start of the next local month."""
+    lt = time.localtime(now)
+    y, m = (lt.tm_year + 1, 1) if lt.tm_mon == 12 else (lt.tm_year, lt.tm_mon + 1)
+    return int(time.mktime((y, m, 1, 0, 0, 0, 0, 1, -1)))
+
+
+def day_end_utc(now):
+    g = time.gmtime(now)
+    return now + (86400 - (g.tm_hour * 3600 + g.tm_min * 60 + g.tm_sec))
+
+
+def month_end_utc(now):
+    g = time.gmtime(now)
+    y, m = (g.tm_year + 1, 1) if g.tm_mon == 12 else (g.tm_year, g.tm_mon + 1)
+    return calendar.timegm((y, m, 1, 0, 0, 0, 0, 1, 0))
+
+
+# --------------------------------------------------------------------------- #
+# persistence (additive contract — MCP server and hooks read these)
 # --------------------------------------------------------------------------- #
 def stored_window():
     """The 5-hour window the published snapshot currently describes, or None."""
@@ -258,22 +414,48 @@ def stored_window():
 
 
 def persist(d, now):
-    five = (d.get("rate_limits") or {}).get("five_hour") or {}
-    if five.get("used_percentage") is None:
-        return
-    seven = (d.get("rate_limits") or {}).get("seven_day") or {}
+    rl = d.get("rate_limits") or {}
+    five, seven = rl.get("five_hour") or {}, rl.get("seven_day") or {}
+    slim = rl.get("spend_limit") or {}
+    usd = float((d.get("cost") or {}).get("total_cost_usd") or 0)
+    spend = update_spend(d.get("session_id") or "", usd, now)
+
+    has_windows = five.get("used_percentage") is not None
+    try:
+        prior_snap = json.loads(SNAPSHOT.read_text())
+    except Exception:
+        prior_snap = {}
+
     snap = {
         "ts": now,
-        "five_hour": {"used_percentage": five.get("used_percentage"),
-                      "resets_at": five.get("resets_at") or 0},
-        "seven_day": {"used_percentage": seven.get("used_percentage") or 0,
-                      "resets_at": seven.get("resets_at") or 0},
+        # Which constraint THIS session is actually under. Subscriber sessions
+        # get rate_limits; API-key, Bedrock and Vertex sessions never do, and
+        # for them the USD budget is the only ceiling that exists.
+        "mode": "quota" if has_windows else "spend",
         "model": (d.get("model") or {}).get("display_name") or "?",
         "model_id": (d.get("model") or {}).get("id") or "",
         "session_id": d.get("session_id") or "",
         "cwd": (d.get("workspace") or {}).get("current_dir") or d.get("cwd") or "",
-        "session_cost_usd": (d.get("cost") or {}).get("total_cost_usd") or 0,
+        "session_cost_usd": usd,
+        "spend": spend,
     }
+    if has_windows:
+        snap["five_hour"] = {"used_percentage": five.get("used_percentage"),
+                             "resets_at": five.get("resets_at") or 0}
+        snap["seven_day"] = {"used_percentage": seven.get("used_percentage") or 0,
+                             "resets_at": seven.get("resets_at") or 0}
+        if slim.get("used_percentage") is not None:
+            # Claude apps gateway spend cap. Percentage can exceed 100 once the
+            # limit is blown, so nothing here clamps it.
+            snap["spend_limit"] = {"used_percentage": slim.get("used_percentage"),
+                                   "resets_at": slim.get("resets_at") or 0}
+        snap["windows_ts"] = now
+    else:
+        # A pay-per-token session must not erase the windows a subscriber
+        # session on the same machine published — carry them, aged.
+        for k in ("five_hour", "seven_day", "spend_limit", "windows_ts"):
+            if k in prior_snap:
+                snap[k] = prior_snap[k]
     # Several Claude Code sessions share these files, and a long-running one can
     # still be reporting a window that has since reset — observed in practice,
     # with resets_at values already in the past sitting alongside current ones.
@@ -282,24 +464,38 @@ def persist(d, now):
     # way: the burn-rate calculation filters on resets_at and wants the older
     # window too.
     prior = stored_window()
-    if prior is None or snap["five_hour"]["resets_at"] >= prior:
-        try:
-            QDIR.mkdir(parents=True, exist_ok=True)
-            tmp = SNAPSHOT.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(snap))
-            tmp.replace(SNAPSHOT)
-        except Exception:
-            return
-    # Append only when the number moved: keeps the burn-rate series meaningful.
+    stale_window = (has_windows and prior is not None
+                    and snap["five_hour"]["resets_at"] < prior)
+    if stale_window:
+        # This session is still reporting a window that has already reset.
+        # Keep the newer one rather than walking the headline numbers back.
+        for k in ("five_hour", "seven_day", "spend_limit", "windows_ts"):
+            if k in prior_snap:
+                snap[k] = prior_snap[k]
     try:
-        last = None
+        QDIR.mkdir(parents=True, exist_ok=True)
+        tmp = SNAPSHOT.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(snap))
+        tmp.replace(SNAPSHOT)
+    except Exception:
+        return
+    # Append only when the number moved: keeps the burn-rate series meaningful.
+    # In spend mode the moving number is dollars, not percent.
+    try:
+        moved = True
         if HISTORY.exists():
             with open(HISTORY, "rb") as f:
                 f.seek(max(0, f.seek(0, 2) - 4096))
                 tail = f.read().decode("utf-8", "replace").splitlines()
             if tail:
-                last = json.loads(tail[-1])["five_hour"]["used_percentage"]
-        if last != snap["five_hour"]["used_percentage"]:
+                last = json.loads(tail[-1])
+                if has_windows:
+                    moved = ((last.get("five_hour") or {}).get("used_percentage")
+                             != snap["five_hour"]["used_percentage"])
+                else:
+                    prev_usd = float((last.get("spend") or {}).get("daily_usd") or 0)
+                    moved = (spend["daily_usd"] - prev_usd) >= 0.01
+        if moved:
             with open(HISTORY, "a") as f:
                 f.write(json.dumps(snap) + "\n")
             # Trim by LINE COUNT, not by size, and only once the file is twice
@@ -310,6 +506,7 @@ def persist(d, now):
                 HISTORY.write_text("\n".join(lines[-3000:]) + "\n")
     except Exception:
         pass
+    return snap
 
 
 # --------------------------------------------------------------------------- #
@@ -321,7 +518,7 @@ def main():
     except Exception:
         return
     now = int(time.time())
-    persist(d, now)
+    snap = persist(d, now)
 
     cost = d.get("cost") or {}
     ctx = d.get("context_window") or {}
@@ -382,26 +579,72 @@ def main():
     if seg:
         print(sep.join(seg))
 
-    # ---- line 2: both windows, one line -----------------------------------
+    # ---- line 2: whichever ceiling this session is actually under ----------
     rl = d.get("rate_limits") or {}
     five, seven = rl.get("five_hour") or {}, rl.get("seven_day") or {}
+    slim = rl.get("spend_limit") or {}
+    joiner = "   " if NO_COLOR else f"  {DIM}·{RESET}  "
+
     if five.get("used_percentage") is None:
-        print(f"{DIM}5h/7d quota  waiting for first API response{RESET}")
+        # No rate_limits: API key, Bedrock or Vertex auth, or a subscriber
+        # session before its first API response. Spend is the only ceiling
+        # available, and it only draws bars once a budget exists.
+        print(joiner.join(spend_parts(snap["spend"], now)))
         return
+
+    # Three windows on one line need narrower bars than two.
+    windows = [w for w in (five, seven, slim) if w.get("used_percentage") is not None]
+    w = WIDTH if len(windows) < 3 else max(6, WIDTH - 4)
 
     parts = []
     p5 = float(five["used_percentage"])
     tail5 = f"{countdown(five.get('resets_at'), now)} left" if five.get("resets_at") else ""
-    parts.append(f"{DIM}5h{RESET} {bar(p5)} {paint(pct_color(p5), f'{p5:.0f}%')}"
+    parts.append(f"{DIM}5h{RESET} {bar(p5, w)} {paint(pct_color(p5), f'{p5:.0f}%')}"
                  + (f" {DIM}{tail5}{RESET}" if tail5 else ""))
 
     if seven.get("used_percentage") is not None:
         p7 = float(seven["used_percentage"])
         tail7 = f"resets {countdown(seven.get('resets_at'), now)}" if seven.get("resets_at") else ""
-        parts.append(f"{DIM}7d{RESET} {bar(p7)} {paint(pct_color(p7), f'{p7:.0f}%')}"
+        parts.append(f"{DIM}7d{RESET} {bar(p7, w)} {paint(pct_color(p7), f'{p7:.0f}%')}"
                      + (f" {DIM}{tail7}{RESET}" if tail7 else ""))
 
-    print(("   " if NO_COLOR else f"  {DIM}·{RESET}  ").join(parts))
+    if slim.get("used_percentage") is not None:
+        ps = float(slim["used_percentage"])
+        tails = f"resets {countdown(slim.get('resets_at'), now)}" if slim.get("resets_at") else ""
+        parts.append(f"{DIM}$lim{RESET} {bar(ps, w)} {paint(pct_color(ps), f'{ps:.0f}%')}"
+                     + (f" {DIM}{tails}{RESET}" if tails else ""))
+
+    print(joiner.join(parts))
+
+
+def spend_parts(spend, now):
+    """Line 2 for pay-per-token sessions: USD spent against the budgets you set."""
+    # A trailing * marks billed amounts (UTC days) rather than the local estimate.
+    mark = "" if spend.get("estimated", True) else "*"
+    rows = [
+        (f"day{mark}", spend["daily_usd"], spend["daily_budget_usd"],
+         spend.get("reset_at") or day_end(now)),
+        (f"mo{mark}", spend["monthly_usd"], spend["monthly_budget_usd"],
+         spend.get("secondary_reset_at") or month_end(now)),
+    ]
+    if not any(r[2] for r in rows):
+        hint = "set QUOTA_BUDGET_USD_DAILY or run set_budget"
+        spent = f"{DIM}today{mark}{RESET} {paint((251, 146, 60), money(spend['daily_usd']))}"
+        month = f"{DIM}month{mark}{RESET} {paint((251, 146, 60), money(spend['monthly_usd']))}"
+        return [spent, month, f"{DIM}{hint}{RESET}"]
+
+    parts = []
+    for label, used, budget, ends in rows:
+        if not budget:
+            parts.append(f"{DIM}{label}{RESET} {paint((251, 146, 60), money(used))}")
+            continue
+        pct = used / budget * 100
+        parts.append(
+            f"{DIM}{label}{RESET} {bar(pct)} "
+            f"{paint(pct_color(pct), money(used))}{DIM}/{money(budget)}{RESET}"
+            f" {DIM}{countdown(ends, now)} left{RESET}"
+        )
+    return parts
 
 
 if __name__ == "__main__":
