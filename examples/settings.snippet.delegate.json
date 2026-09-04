@@ -1,0 +1,7 @@
+{
+  "statusLine": {
+    "type": "command",
+    "command": "CLAUDE_QUOTA_DELEGATE=\"$HOME/.claude/hooks/statusline.sh\" python3 \"$HOME/.claude/quota/statusline-quota.py\"",
+    "refreshInterval": 30
+  }
+}

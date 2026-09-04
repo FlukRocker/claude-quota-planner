@@ -1,0 +1,10 @@
+# Runtime state — your own usage data, never commit it
+snapshot.json
+history.jsonl
+costs.json
+.gitcache.json
+
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store

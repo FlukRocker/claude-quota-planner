@@ -1,0 +1,9 @@
+# Quota planning
+
+Before starting any medium or large task, call `check_budget`. If you are
+planning multi-step work, call `plan_session` first and follow its ordering.
+After finishing a task, call `record_task_cost` with the quota delta.
+
+The estimates start as seeds and only become real after two `record_task_cost`
+calls per category+model, so recording is what makes the tool worth having.
+Read the burn-rate warning rather than the table when the two disagree.
